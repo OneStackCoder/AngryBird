@@ -40,7 +40,7 @@ class Game(
 
         private const val MAX_DRAG = 1.35f
         private const val FIXED_STEP = 1f / 60f
-        private const val MAX_STEPS = 5
+        private const val MAX_STEPS = 15
         private const val PIG_HEALTH = 1.8f
 
         private fun healthOf(m: Material): Float = when (m) {
@@ -78,8 +78,15 @@ class Game(
     var ppm = 80f
         private set
 
+    /** 用户捏合缩放因子（0.65 ~ 2.2），由 GameView 写入 */
+    @Volatile
+    var zoom = 1f
+
     var cameraX = 16f
     var cameraY = 0f
+
+    /** 用户手动平移后暂缓自动跟随的剩余时间（秒），期间相机停留在用户拖动的位置 */
+    private var panHold = 0f
 
     // ------------------------------------------------------------ 玩法状态
 
@@ -108,6 +115,10 @@ class Game(
         private set
 
     var paused = false
+
+    /** 快进中（飞行/结算阶段点击屏幕触发，3 倍速模拟，回到瞄准时自动关闭） */
+    var fastForward = false
+        private set
 
     var shake = 0f
         private set
@@ -151,6 +162,10 @@ class Game(
     /** 仅在发射后的前 2.2 秒提示技能，避免长期遮挡画面 */
     val abilityHint: Boolean
         get() = abilityReady && flyingTimer < 2.2f
+
+    /** 仅在发射后的前 1.8 秒提示可平移 / 快进 */
+    val panHint: Boolean
+        get() = state == PlayState.FLYING && flyingTimer < 1.8f
 
     // ---- 弹弓拖拽 ----
 
@@ -231,10 +246,12 @@ class Game(
     private fun createGround() {
         val bd = BodyDef()
         bd.type = BodyType.STATIC
-        bd.position.set(0f, -0.5f)
+        // 顶面保持 y = 0；加厚防止高速物体穿透，
+        // 加宽覆盖出界判定区（x ∈ [width, width+12] 原先是悬空的）
+        bd.position.set(0f, -2f)
 
         val shape = PolygonShape()
-        shape.setAsBox(spec.width, 0.5f)
+        shape.setAsBox(spec.width + 20f, 2f)
 
         val fd = FixtureDef()
         fd.shape = shape
@@ -373,7 +390,7 @@ class Game(
         val first = this.viewWidth <= 0f
         this.viewWidth = viewWidth
         this.viewHeight = viewHeight
-        ppm = min(viewWidth / 22f, viewHeight / 11.5f)
+        ppm = min(viewWidth / 22f, viewHeight / 11.5f) * zoom
         val baseY = 0.35f * (viewHeight / ppm)
         if (first) {
             cameraY = baseY
@@ -393,12 +410,14 @@ class Game(
             bombAiming = false
             return
         }
+        // 快进：以 3 倍速推进整个模拟（物理 / 粒子 / 相机一致加速）
+        val d = if (fastForward) dt * 3f else dt
 
         if (state != PlayState.WON && state != PlayState.LOST) {
-            warmup = (warmup - dt).coerceAtLeast(0f)
-            hitSoundCooldown = (hitSoundCooldown - dt).coerceAtLeast(0f)
+            warmup = (warmup - d).coerceAtLeast(0f)
+            hitSoundCooldown = (hitSoundCooldown - d).coerceAtLeast(0f)
 
-            accumulator += dt.coerceAtMost(0.05f)
+            accumulator += d.coerceAtMost(0.05f)
             var steps = 0
             while (accumulator >= FIXED_STEP && steps < MAX_STEPS) {
                 world.step(FIXED_STEP, 8, 3)
@@ -410,18 +429,18 @@ class Game(
             resolveDestruction()
 
             when (state) {
-                PlayState.FLYING -> updateFlying(dt)
-                PlayState.SETTLE -> updateSettle(dt)
+                PlayState.FLYING -> updateFlying(d)
+                PlayState.SETTLE -> updateSettle(d)
                 else -> {}
             }
 
             if (pigs.isEmpty() && state != PlayState.WON) finishWin()
         }
 
-        updateEffects(dt)
-        updateCamera(dt)
-        shake = (shake - dt * 2.4f).coerceAtLeast(0f)
-        flashAlpha = (flashAlpha - dt * 1.8f).coerceAtLeast(0f)
+        updateEffects(d)
+        updateCamera(d)
+        shake = (shake - d * 2.4f).coerceAtLeast(0f)
+        flashAlpha = (flashAlpha - d * 1.8f).coerceAtLeast(0f)
     }
 
     private fun updateFlying(dt: Float) {
@@ -438,6 +457,12 @@ class Game(
             settleTimer = 0f
             return
         }
+        // 飞行总超时：避免小鸟长时间慢滚导致一直无法进入结算
+        if (flyingTimer > 5f) {
+            state = PlayState.SETTLE
+            settleTimer = 0f
+            return
+        }
         if (flyingTimer > 1.4f && worldCalm()) {
             state = PlayState.SETTLE
             settleTimer = 0f
@@ -446,10 +471,12 @@ class Game(
 
     private fun updateSettle(dt: Float) {
         settleTimer += dt
-        if (settleTimer > 4.5f || (settleTimer > 0.6f && worldCalm())) nextTurn()
+        if (settleTimer > 2f || (settleTimer > 0.5f && worldCalm())) nextTurn()
     }
 
     private fun nextTurn() {
+        fastForward = false
+        panHold = 0f
         val bird = activeBird
         if (bird != null) {
             birds.remove(bird)
@@ -480,6 +507,7 @@ class Game(
 
     private fun finishWin() {
         if (state == PlayState.WON) return
+        fastForward = false
         val remaining = (spec.birds.size - birdsUsed).coerceAtLeast(0)
         if (remaining > 0) {
             score += remaining * 10000
@@ -500,6 +528,7 @@ class Game(
             finishWin()
             return
         }
+        fastForward = false
         state = PlayState.LOST
         starsEarned = 0
         dragging = false
@@ -675,6 +704,7 @@ class Game(
             onAbilityTap()
             return
         }
+        if (state == PlayState.SETTLE) return
         if (state != PlayState.AIM) return
         if (spec.birds.getOrNull(birdsUsed) == null) return
 
@@ -684,6 +714,42 @@ class Game(
             dragging = true
             updateAim(wx, wy)
         }
+    }
+
+    /** 取消弹弓拖拽并复位瞄准点（双指缩放开始时调用） */
+    fun cancelDrag() {
+        if (dragging) {
+            dragging = false
+            aimX = SLING_X
+            aimY = SLING_Y
+        }
+    }
+
+    /**
+     * 用户单指拖动平移镜头（向右拖 = 视野向左移）。
+     * 平移后 [panHold] 秒内暂停自动跟随，超时或进入新回合后恢复。
+     */
+    fun panBy(dxPx: Float) {
+        if (paused || state == PlayState.WON || state == PlayState.LOST) return
+        if (ppm <= 0f || viewWidth <= 0f) return
+
+        val half = viewWidth / ppm / 2f
+        // 允许查看的范围：弹弓左侧留 5.5m，关卡右端外留 3m
+        val minX = SLING_X - 5.5f + half
+        val maxX = spec.width + 3f - half
+        cameraX = if (maxX > minX) {
+            (cameraX - dxPx / ppm).coerceIn(minX, maxX)
+        } else {
+            (minX + maxX) * 0.5f
+        }
+        panHold = 3f
+    }
+
+    /** 飞行/结算阶段在空白处轻点：快进等待（拖动镜头、点按钮不会触发） */
+    fun onTapEmpty() {
+        if (paused || bombAiming) return
+        if (state == PlayState.FLYING && !abilityReady) fastForward = true
+        else if (state == PlayState.SETTLE) fastForward = true
     }
 
     fun onTouchMove(wx: Float, wy: Float) {
@@ -729,6 +795,7 @@ class Game(
         state = PlayState.FLYING
         flyingTimer = 0f
         settleTimer = 0f
+        panHold = 0f
         aimX = SLING_X
         aimY = SLING_Y
     }
@@ -783,12 +850,12 @@ class Game(
     private fun worldCalm(): Boolean {
         for (e in blocks) {
             if (e.removed) continue
-            if (e.body.linearVelocity.length() > 0.55f) return false
+            if (e.body.linearVelocity.length() > 0.7f) return false
             if (abs(e.body.angularVelocity) > 1.8f) return false
         }
         for (e in pigs) {
             if (e.removed) continue
-            if (e.body.linearVelocity.length() > 0.55f) return false
+            if (e.body.linearVelocity.length() > 0.7f) return false
         }
         val bird = activeBird ?: return true
         return bird.body.linearVelocity.length() < 1f
@@ -806,6 +873,15 @@ class Game(
         if (state == PlayState.WON || state == PlayState.LOST) return
 
         val baseY = 0.35f * (viewHeight / ppm)
+
+        // 手动平移观察期间：X 保持在用户拖动的位置，Y 仍跟随基准（缩放时地面位置稳定）
+        if (panHold > 0f) {
+            panHold -= dt
+            val kY = (1f - exp(-dt * 3.2f)).coerceIn(0f, 1f)
+            cameraY += (baseY - cameraY) * kY
+            return
+        }
+
         var tx = focusX()
         var ty = baseY
 

@@ -51,6 +51,15 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
     private var dragging = false
     private var moved = false
 
+    // ---- 单指平移镜头状态（渲染线程消费） ----
+    private var panning = false
+    private var lastX = 0f
+
+    // ---- 双指捏合缩放状态（UI 线程直接维护） ----
+    private var pinching = false
+    private var pinchStartDist = 0f
+    private var pinchStartZoom = 1f
+
     init {
         holder.addCallback(this)
         isFocusable = true
@@ -139,15 +148,71 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN,
-            MotionEvent.ACTION_MOVE,
+            MotionEvent.ACTION_DOWN -> {
+                pinching = false
+                pendingTouches.add(TouchEvent(event.actionMasked, event.x, event.y))
+            }
+
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                if (event.pointerCount >= 2) {
+                    // 进入双指捏合：取消正在进行的弹弓拖拽，丢弃排队中的单指事件
+                    pinching = true
+                    pinchStartDist = pinchDistance(event)
+                    pinchStartZoom = game?.zoom ?: 1f
+                    pendingTouches.clear()
+                    dragging = false
+                    game?.cancelDrag()
+                }
+            }
+
+            MotionEvent.ACTION_POINTER_UP -> {
+                // 抬起一指后仍处于捏合手势收尾阶段，忽略剩余单指移动
+                lastPointerUpTime = event.eventTime
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                if (pinching) {
+                    if (event.pointerCount >= 2) {
+                        val dist = pinchDistance(event)
+                        if (pinchStartDist > 1f && dist > 1f) {
+                            val zoom = (pinchStartZoom * dist / pinchStartDist)
+                                .coerceIn(0.65f, 2.2f)
+                            game?.zoom = zoom
+                        }
+                    }
+                } else {
+                    pendingTouches.add(TouchEvent(event.actionMasked, event.x, event.y))
+                }
+            }
+
             MotionEvent.ACTION_UP,
-            MotionEvent.ACTION_CANCEL -> pendingTouches.add(
-                TouchEvent(event.actionMasked, event.x, event.y)
-            )
+            MotionEvent.ACTION_CANCEL -> {
+                pinching = false
+                if (!pinchConsumedGesture(event)) {
+                    pendingTouches.add(TouchEvent(event.actionMasked, event.x, event.y))
+                }
+            }
         }
         return true
     }
+
+    /** 两指间距（px） */
+    private fun pinchDistance(event: MotionEvent): Float {
+        val dx = event.getX(0) - event.getX(1)
+        val dy = event.getY(0) - event.getY(1)
+        return kotlin.math.sqrt(dx * dx + dy * dy)
+    }
+
+    /** 捏合手势中最后一根手指抬起的时间 */
+    private var lastPointerUpTime = 0L
+
+    /**
+     * ACTION_UP 时判断这次手势是否已被捏合消费：
+     * 若 UP 距离最后一次 POINTER_UP 很近，视为捏合手势的一部分，不再当点击分发，
+     * 避免捏合结束误触发技能 / 快进 / 按钮。
+     */
+    private fun pinchConsumedGesture(event: MotionEvent): Boolean =
+        event.eventTime - lastPointerUpTime < 250L
 
     // ------------------------------------------------------------ 渲染线程
 
@@ -201,7 +266,10 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
                 MotionEvent.ACTION_DOWN -> handleDown(event.x, event.y)
                 MotionEvent.ACTION_MOVE -> handleMove(event.x, event.y)
                 MotionEvent.ACTION_UP -> handleUp(event.x, event.y)
-                MotionEvent.ACTION_CANCEL -> dragging = false
+                MotionEvent.ACTION_CANCEL -> {
+                    dragging = false
+                    panning = false
+                }
             }
         }
     }
@@ -279,6 +347,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         downY = y
         moved = false
         dragging = false
+        panning = false
 
         if (scene != Scene.PLAYING) return
         val current = game ?: return
@@ -302,12 +371,33 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
         val threshold = viewHeight * 0.02f
         if (!moved && dx * dx + dy * dy > threshold * threshold) moved = true
 
+        // 游戏内未拉弓时的水平拖动 = 平移镜头（跟手）
+        if (scene == Scene.PLAYING) {
+            val current = game
+            if (current != null && !panning && moved && !current.dragging && !current.paused &&
+                current.state != PlayState.WON && current.state != PlayState.LOST
+            ) {
+                panning = true
+                lastX = x
+            }
+            if (panning) {
+                val g = game ?: return
+                g.panBy(x - lastX)
+                lastX = x
+                return
+            }
+        }
+
         if (!dragging) return
         val current = game ?: return
         current.onTouchMove(toWorldX(x, current), toWorldY(y, current))
     }
 
     private fun handleUp(x: Float, y: Float) {
+        if (panning) {
+            panning = false
+            return
+        }
         if (dragging) {
             dragging = false
             val current = game
@@ -412,7 +502,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback 
 
         if (Ui.pauseButton(width, height).contains(x, y)) {
             current.paused = true
+            return
         }
+
+        // 空白处轻点：飞行/结算阶段快进等待
+        current.onTapEmpty()
     }
 
     private fun startLevel(index: Int) {

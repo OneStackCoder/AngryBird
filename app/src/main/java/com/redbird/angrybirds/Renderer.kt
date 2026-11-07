@@ -738,6 +738,11 @@ class Renderer {
                 canvas, "点击目标位置投下炸弹", width / 2f, height * 0.90f,
                 height * 0.036f, 0xFFFFF176.toInt()
             )
+        } else if (game.fastForward) {
+            drawText(
+                canvas, ">> 快进中", width / 2f, height * 0.90f,
+                height * 0.036f, 0xFFFFF176.toInt()
+            )
         } else if (game.abilityHint) {
             val tip = when (game.flyingBirdType) {
                 BirdType.YELLOW -> "点击屏幕：冲刺加速！"
@@ -751,6 +756,11 @@ class Renderer {
                     height * 0.034f, Color.argb(alpha, 255, 255, 255)
                 )
             }
+        } else if (game.panHint) {
+            drawText(
+                canvas, "拖动屏幕查看战场 · 轻点快进", width / 2f, height * 0.90f,
+                height * 0.032f, 0xCCFFFFFF.toInt()
+            )
         }
 
         if (game.state == PlayState.AIM && !game.paused && !game.bombAiming &&
