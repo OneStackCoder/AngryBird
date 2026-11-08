@@ -25,6 +25,7 @@ enum class GameSound {
     ICE,
     STONE,
     PIG,
+    PIG_OINK,
     EXPLODE,
     GOLD,
     WIN,
@@ -76,7 +77,27 @@ class GameAudio {
         build(GameSound.PIG, 0.22f) { t, p, n ->
             val f = 620f - 320f * p
             val env = sin(PI.toFloat() * p.coerceIn(0f, 1f))
-            (sin(TAU * f * t) * 0.65f + n * 0.08f) * env
+            (sin(TAU * f * t) * 0.85f + n * 0.1f) * env
+        }
+
+        // 猪"哼哼"两声：受击 / 闲置时发出，区别于死亡的 PIG（啵）。
+        // 基频提高到 349/311Hz 并加强 2.5 倍共振峰——小扬声器低频还原差，
+        // 之前的 292Hz 低嗡声在实际设备上几乎听不见。
+        build(GameSound.PIG_OINK, 0.34f) { t, p, n ->
+            val phase = when {
+                p < 0.36f -> p / 0.36f
+                p >= 0.56f -> (p - 0.56f) / 0.44f
+                else -> -1f
+            }
+            if (phase < 0f) {
+                0f
+            } else {
+                val f = if (p < 0.5f) 349f else 311f
+                val env = sin(PI.toFloat() * phase)
+                (sin(TAU * f * t) * 0.85f +
+                    sin(TAU * f * 2.5f * t) * 0.35f +
+                    n * 0.18f) * env
+            }
         }
 
         build(GameSound.EXPLODE, 0.5f) { t, _, n ->
@@ -231,6 +252,7 @@ class Haptics(context: Context) {
             GameSound.ICE -> { duration = 10L; amplitude = 70 }
             GameSound.STONE -> { duration = 16L; amplitude = 120 }
             GameSound.PIG -> { duration = 20L; amplitude = 140 }
+            GameSound.PIG_OINK -> return // 哼哼声不震动
             GameSound.EXPLODE -> { duration = 55L; amplitude = 220 }
             GameSound.GOLD -> { duration = 18L; amplitude = 110 }
             GameSound.WIN -> { duration = 90L; amplitude = 180 }

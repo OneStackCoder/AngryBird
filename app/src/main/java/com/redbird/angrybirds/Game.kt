@@ -6,12 +6,14 @@ import org.jbox2d.collision.Manifold
 import org.jbox2d.collision.shapes.CircleShape
 import org.jbox2d.collision.shapes.PolygonShape
 import org.jbox2d.common.Vec2
+import org.jbox2d.dynamics.Body
 import org.jbox2d.dynamics.BodyDef
 import org.jbox2d.dynamics.BodyType
 import org.jbox2d.dynamics.FixtureDef
 import org.jbox2d.dynamics.World
 import org.jbox2d.dynamics.contacts.Contact
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.max
@@ -188,6 +190,10 @@ class Game(
     private val pendingExplosions = mutableListOf<Explosion>()
     private val soundQueue = mutableListOf<GameSound>()
     private var hitSoundCooldown = 0f
+    private var oinkCooldown = 0f
+    private var idleOinkTimer = 3.5f
+    /** 猪清空后的等待计时（-1 = 还有猪）。满 1 秒且世界静止（鸟滚完）后结算胜利，6 秒兜底 */
+    private var pigClearedTimer = -1f
 
     private class Explosion(val x: Float, val y: Float, val radius: Float, val power: Float)
 
@@ -229,6 +235,11 @@ class Game(
         override fun postSolve(contact: Contact, impulse: ContactImpulse) {}
     }
 
+    // 弹弓鸟 / 排队鸟的碰撞体字段：必须在下方 init（buildWorld）执行前完成初始化，
+    // 因此声明在这里而不是函数区中间——Kotlin 属性按声明顺序初始化。
+    private var aimBirdBody: Body? = null
+    private val waitingBirdBodies = mutableListOf<Body>()
+
     init {
         world.setContactListener(contactListener)
         buildWorld()
@@ -241,6 +252,75 @@ class Game(
         for (b in spec.blocks) createBlock(b)
         for (p in spec.pigs) createPig(p)
         spec.egg?.let { createEgg(it) }
+        createAimBird()
+        createWaitingBirds()
+    }
+
+    /**
+     * 弹弓上待发射小鸟的碰撞体（kinematic，无限质量）。
+     * 渲染层画在 aimX/aimY 的鸟本身没有物理体——没有它，猪/块滚过来会直接穿过去。
+     * userData 保持 null：beginContact 会跳过伤害与音效链，仅提供物理阻挡。
+     * （字段 aimBirdBody 声明在上方 init 块之前，见注释）
+     */
+    private fun createAimBird() {
+        destroyAimBird()
+        if (state != PlayState.AIM) return
+        if (spec.birds.getOrNull(birdsUsed) == null) return
+
+        val bd = BodyDef()
+        bd.type = BodyType.KINEMATIC
+        bd.position.set(aimX, aimY)
+
+        val shape = CircleShape()
+        shape.m_radius = BIRD_RADIUS
+
+        val fd = FixtureDef()
+        fd.shape = shape
+        fd.density = 1f
+        fd.friction = 0.5f
+        fd.restitution = 0.25f
+
+        aimBirdBody = world.createBody(bd).also { it.createFixture(fd) }
+    }
+
+    private fun destroyAimBird() {
+        aimBirdBody?.let { world.destroyBody(it) }
+        aimBirdBody = null
+    }
+
+    /** 弹弓后方排队小鸟的碰撞体（与渲染位置一一对应；字段声明在 init 之前） */
+    private fun createWaitingBirds() {
+        destroyWaitingBirds()
+        val waiting = waitingBirds
+        for (i in waiting.indices) {
+            val bd = BodyDef()
+            bd.type = BodyType.KINEMATIC
+            bd.position.set(SLING_X - 1.35f - i * 0.82f, 0.36f)
+
+            val shape = CircleShape()
+            shape.m_radius = 0.34f
+
+            val fd = FixtureDef()
+            fd.shape = shape
+            fd.density = 1f
+            fd.friction = 0.5f
+            fd.restitution = 0.2f
+
+            waitingBirdBodies += world.createBody(bd).also { it.createFixture(fd) }
+        }
+    }
+
+    private fun destroyWaitingBirds() {
+        for (b in waitingBirdBodies) world.destroyBody(b)
+        waitingBirdBodies.clear()
+    }
+
+    /** 拖拽 / 复位后同步碰撞体位置（圆体角度不影响碰撞，设为发射方向仅为语义一致） */
+    private fun syncAimBird() {
+        aimBirdBody?.setTransform(
+            Vec2(aimX, aimY),
+            atan2(SLING_Y - aimY, SLING_X - aimX)
+        )
     }
 
     private fun createGround() {
@@ -298,6 +378,8 @@ class Game(
         bd.type = BodyType.DYNAMIC
         bd.position.set(spec.x, spec.y)
         bd.allowSleep = true
+        // 旋转阻尼：没有它圆形猪会无限滚动，被撞飞后能滚出半个地图
+        bd.angularDamping = 0.85f
 
         val shape = CircleShape()
         shape.m_radius = spec.radius
@@ -351,6 +433,8 @@ class Game(
         val bd = BodyDef()
         bd.type = BodyType.DYNAMIC
         bd.position.set(x, y)
+        // 初始姿态对准发射方向：与拉弓时的渲染角度无缝衔接（圆形体角度不影响碰撞）
+        bd.angle = atan2(vy, vx)
         bd.bullet = true
         bd.allowSleep = false
         bd.linearDamping = 0.04f
@@ -416,6 +500,14 @@ class Game(
         if (state != PlayState.WON && state != PlayState.LOST) {
             warmup = (warmup - d).coerceAtLeast(0f)
             hitSoundCooldown = (hitSoundCooldown - d).coerceAtLeast(0f)
+            oinkCooldown = (oinkCooldown - d).coerceAtLeast(0f)
+
+            // 存活的猪每隔几秒随机"哼哼"一声，对齐原版的临场感
+            idleOinkTimer -= d
+            if (idleOinkTimer <= 0f) {
+                idleOinkTimer = 2.5f + Math.random().toFloat() * 2.5f
+                if (pigs.isNotEmpty() && !paused) emit(GameSound.PIG_OINK)
+            }
 
             accumulator += d.coerceAtMost(0.05f)
             var steps = 0
@@ -434,7 +526,16 @@ class Game(
                 else -> {}
             }
 
-            if (pigs.isEmpty() && state != PlayState.WON) finishWin()
+            // 猪清光后：等鸟停止滚动、块落定（worldCalm）再结算；6 秒兜底防卡死
+            if (state != PlayState.WON) {
+                if (pigs.isEmpty()) {
+                    if (pigClearedTimer < 0f) pigClearedTimer = 0f
+                    pigClearedTimer += d
+                    if (pigClearedTimer >= 1f && (worldCalm() || pigClearedTimer >= 6f)) finishWin()
+                } else {
+                    pigClearedTimer = -1f
+                }
+            }
         }
 
         updateEffects(d)
@@ -488,7 +589,7 @@ class Game(
         }
 
         if (pigs.isEmpty()) {
-            finishWin()
+            // 不在此处立即结算：交给 update 的 pigClearedTimer 延迟触发（演出收尾）
             return
         }
         if (birdsUsed >= spec.birds.size) {
@@ -503,11 +604,15 @@ class Game(
         bombAiming = false
         flyingTimer = 0f
         settleTimer = 0f
+        createAimBird()
+        createWaitingBirds()
     }
 
     private fun finishWin() {
         if (state == PlayState.WON) return
         fastForward = false
+        destroyAimBird()
+        destroyWaitingBirds()
         val remaining = (spec.birds.size - birdsUsed).coerceAtLeast(0)
         if (remaining > 0) {
             score += remaining * 10000
@@ -529,6 +634,8 @@ class Game(
             return
         }
         fastForward = false
+        destroyAimBird()
+        destroyWaitingBirds()
         state = PlayState.LOST
         starsEarned = 0
         dragging = false
@@ -567,6 +674,12 @@ class Game(
         }
         val dmg = (rel - 3f) * sourceMass * 0.20f * vulnerability(target)
         if (dmg < 0.05f) return
+
+        // 猪被撞到就"哼哼"叫（无论是否致死），独立节流避免连撞太吵
+        if (target.type == EntityType.PIG && dmg > 0.06f && oinkCooldown <= 0f) {
+            oinkCooldown = 1.2f
+            emit(GameSound.PIG_OINK)
+        }
 
         if (dmg > 0.6f) {
             spawnBurst(target.x, target.y, 3, colorOf(target), 2.5f)
@@ -722,6 +835,7 @@ class Game(
             dragging = false
             aimX = SLING_X
             aimY = SLING_Y
+            syncAimBird()
         }
     }
 
@@ -767,6 +881,7 @@ class Game(
         if (dx * dx + dy * dy < 0.02f) {
             aimX = SLING_X
             aimY = SLING_Y
+            syncAimBird()
             return
         }
         launch()
@@ -782,10 +897,15 @@ class Game(
         }
         aimX = SLING_X + dx
         aimY = SLING_Y + dy
+        syncAimBird()
     }
 
     private fun launch() {
         val type = spec.birds.getOrNull(birdsUsed) ?: return
+        // 发射瞬间：销毁弹弓鸟碰撞体，同位置由 spawnBird 接管为动态体；
+        // 排队鸟碰撞体也要重建（发射后队列整体前移一位）
+        destroyAimBird()
+        destroyWaitingBirds()
         val vx = (SLING_X - aimX) * LAUNCH_POWER
         val vy = (SLING_Y - aimY) * LAUNCH_POWER
 
@@ -798,6 +918,8 @@ class Game(
         panHold = 0f
         aimX = SLING_X
         aimY = SLING_Y
+        // 飞行期间队列里的鸟仍渲染在排队位置（waitingBirds = drop(birdsUsed)），碰撞体保持存在
+        createWaitingBirds()
     }
 
     /** 切换投弹瞄准模式；返回是否进入瞄准 */
@@ -829,6 +951,9 @@ class Game(
                 }
                 val speed = (len + 9f).coerceAtMost(34f)
                 bird.body.setLinearVelocity(Vec2(nx * speed, ny * speed))
+                // 姿态对准冲刺方向，并清掉残余自旋
+                bird.body.setTransform(bird.body.position, atan2(ny, nx))
+                bird.body.angularVelocity = 0f
                 spawnBurst(bird.x, bird.y, 14, 0xFFFFE082.toInt(), 4f)
             }
 

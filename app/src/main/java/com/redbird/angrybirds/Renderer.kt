@@ -100,7 +100,8 @@ class Renderer {
                 pig.radius * game.ppm,
                 pig.damage,
                 pig.hitFlash,
-                time
+                time,
+                -pig.angle
             )
         }
         for (egg in game.eggs) {
@@ -1114,12 +1115,17 @@ class Renderer {
         r: Float,
         damage: Float,
         hitFlash: Float,
-        time: Float
+        time: Float,
+        angleRad: Float
     ) {
         val flash = (hitFlash / 0.2f).coerceIn(0f, 1f)
         val x = cx + if (flash > 0f) sin(time * 80f) * r * 0.12f * flash else 0f
         val bob = sin(time * 2.2f + x * 0.01f) * r * 0.03f
         val y = cy + bob
+
+        // 跟随物理旋转：被撞飞/滚落时整只猪（含表情）一起转
+        canvas.save()
+        canvas.rotate(angleRad * RAD_TO_DEG, x, y)
 
         fill.color = 0xFF6FAF37.toInt()
         canvas.drawCircle(x - r * 0.55f, y - r * 0.74f, r * 0.32f, fill)
@@ -1196,6 +1202,8 @@ class Renderer {
                 )
             }
         }
+
+        canvas.restore()
     }
 
     private fun drawEgg(canvas: Canvas, cx: Float, cy: Float, r: Float, time: Float) {
